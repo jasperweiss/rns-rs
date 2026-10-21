@@ -111,6 +111,25 @@ bash scripts/package-rns-server-tarball.sh
 This builds the single binary and writes `dist/rns-server-<os>-<arch>.tar.gz`
 together with the operator runbook.
 
+## GitHub release archive
+
+Pushing a tag named `rns-v<version>` runs
+[`.github/workflows/release.yml`](../.github/workflows/release.yml). The same
+workflow can be started by hand with that tag as its input. It publishes one
+stripped Linux x86_64 archive, `rns-<version>-linux-x86_64.tar.gz`, plus
+`SHA256SUMS` and `SHA512SUMS`. GitHub signs a build-provenance attestation for
+those three files.
+
+The archive contains `rns-server`, `rns-ctl`, the `rns-cli` tools (including
+`rns-statsd` and `rns-sentineld`), `rngit`, `git-remote-rns`, `rngcs`, and
+`rntun`. They are built with each package's default features and
+`rns-hooks-native`. The ESP32 firmware and the Android client are not in this
+archive.
+
+```bash
+gh attestation verify rns-0.6.0-linux-x86_64.tar.gz --repo jasperweiss/rns-rs
+```
+
 ## Cross-building for ARMv7
 
 CI builds the runtime binaries for `armv7-unknown-linux-gnueabihf` on every

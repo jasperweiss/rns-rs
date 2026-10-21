@@ -1,0 +1,200 @@
+name: Release
+
+# Builds the host Reticulum binaries and publishes one Linux x86_64 tarball.
+# Push a tag such as rns-v0.6.0, or run this workflow and pass that tag.
+# ESP32 firmware stays on esp32-release.yml. The Android client is not included.
+
+on:
+  push:
+    tags:
+      - 'rns-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example rns-v0.6.0
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux x86_64 archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      archive: ${{ steps.version.outputs.archive }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            rns-v[0-9A-Za-z]*) ;;
+            *)
+              echo "tag must look like rns-v0.6.0, got: $TAG" >&2
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#rns-v}"
+          case "$VERSION" in
+            *[!0-9A-Za-z._+-]*)
+              echo "version contains unsupported characters: $VERSION" >&2
+              exit 1
+              ;;
+          esac
+          ARCHIVE="rns-${VERSION}-linux-x86_64.tar.gz"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build server, control tool, and CLI
+        run: |
+          set -euo pipefail
+          # Separate package builds so --features applies to one manifest.
+          # Native hooks enable the rns-statsd and rns-sentineld sidecars.
+          cargo build --release --locked -p rns-cli --features rns-hooks-native
+          cargo build --release --locked -p rns-ctl --features rns-hooks-native
+          cargo build --release --locked -p rns-server --features rns-hooks-native
+
+      - name: Build git tools and tunnel
+        run: cargo build --release --locked -p rns-git -p rns-tun
+
+      - name: Pack the release archive
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+        run: |
+          set -euo pipefail
+          bins=(
+            rns-server
+            rns-ctl
+            rnsd
+            rnstatus
+            rnpath
+            rnid
+            rnprobe
+            rnsh
+            rncp
+            rnx
+            rns-statsd
+            rns-sentineld
+            rngit
+            git-remote-rns
+            rngcs
+            rntun
+          )
+          stage="dist/rns-${VERSION}-linux-x86_64"
+          rm -rf dist
+          mkdir -p "$stage/bin" "$stage/docs"
+          for bin in "${bins[@]}"; do
+            src="target/release/${bin}"
+            if [ ! -x "$src" ]; then
+              echo "missing binary: $src" >&2
+              exit 1
+            fi
+            install -m 0755 "$src" "$stage/bin/$bin"
+            strip --strip-unneeded "$stage/bin/$bin"
+          done
+          cp docs/rns-server-operator-runbook.md docs/cli-tools.md "$stage/docs/"
+          cp LICENSE "$stage/LICENSE"
+          printf '%s\n' \
+            "tag=${TAG}" \
+            "version=${VERSION}" \
+            "commit=${GITHUB_SHA}" \
+            "target=x86_64-unknown-linux-gnu" \
+            "rustc=1.96.0" \
+            "hooks=rns-hooks-native" \
+            > "$stage/VERSION"
+          tar -C dist -czf "dist/${ARCHIVE}" "rns-${VERSION}-linux-x86_64"
+          (
+            cd dist
+            sha256sum -- "$ARCHIVE" > SHA256SUMS
+            sha512sum -- "$ARCHIVE" > SHA512SUMS
+          )
+          cat dist/SHA256SUMS dist/SHA512SUMS
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rns-linux-x86_64
+          path: |
+            dist/${{ steps.version.outputs.archive }}
+            dist/SHA256SUMS
+            dist/SHA512SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download release archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rns-linux-x86_64
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS
+          sha512sum --check --strict SHA512SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/${{ needs.build.outputs.archive }}
+            dist/SHA256SUMS
+            dist/SHA512SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: rns ${{ needs.build.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ needs.build.outputs.archive }}
+            dist/SHA256SUMS
+            dist/SHA512SUMS
